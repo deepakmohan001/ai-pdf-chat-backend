@@ -1,4 +1,3 @@
-
 text = """
 Python is a programming language.
 FastAPI is used to build APIs.
