@@ -1,165 +1,425 @@
-from fastapi import APIRouter, UploadFile, File
+from fastapi import APIRouter, UploadFile, File, HTTPException
 from pydantic import BaseModel
-from app.database.connection import documents_collection
-import shutil
-from pypdf import PdfReader
-from bson import ObjectId
+from app.database.connection import documents_collection, chat_history_collection
 from app.services.chunking import split_text_into_chunks
 from app.services.embedding import generate_embedding
+from app.services.ollama_service import generate_answer
+from sentence_transformers import util
+from pypdf import PdfReader
+from bson import ObjectId
+import shutil
+import os
+from datetime import datetime, timezone
+import uuid
+
 
 router = APIRouter()
 
+
+# Request model
 class QuestionRequest(BaseModel):
     question: str
+    document_id: str
 
 
+# Home endpoint
 @router.get("/")
 def home():
     return {
         "message": "Welcome to AI PDF Chat Application"
     }
-    
-    
+
+
 @router.post("/ask")
 def ask_question(data: QuestionRequest):
-    return {
-        "message": "Your question was received",
-        "question": data.question
-    }    
+
+    # Step 1: Generate embedding for the question
+    question_embedding = generate_embedding(data.question)
+
+    # Step 2: Validate document ID
+    if not ObjectId.is_valid(data.document_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid document ID"
+        )
+
+    # Step 3: Retrieve selected PDF
+    document = documents_collection.find_one({
+        "_id": ObjectId(data.document_id),
+        "chunks": {"$exists": True}
+    })
+
+    # Step 4: Check whether document exists
+    if not document:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found or PDF has not been processed"
+        )
+
+    best_match = None
+    highest_score = -1
+
+    # Step 5: Search through PDF chunks
+    chunks = document.get("chunks", [])
+
+    for chunk in chunks:
+
+        chunk_embedding = chunk["embedding"]
+
+        similarity = util.cos_sim(
+            question_embedding,
+            chunk_embedding
+        )
+
+        score = similarity.item()
+
+        if score > highest_score:
+            highest_score = score
+            best_match = chunk
+
+    # Step 6: Check similarity threshold
+    SIMILARITY_THRESHOLD = 0.40
+
+    if best_match is None or highest_score < SIMILARITY_THRESHOLD:
+        raise HTTPException(
+            status_code=404,
+            detail="No relevant information found in the selected document"
+        )
+
+    # Step 7: Generate answer using Ollama
+    answer = generate_answer(
+        data.question,
+        best_match["text"]
+    )
     
-    
-@router.post("/documents")
-def create_document():
-    document = {
-        "filename": "python_notes.pdf",
-        "file_type": "application/pdf"
+    # Save chat history in MongoDB
+    chat_record = {
+        "document_id": data.document_id,
+        "filename": document["filename"],
+        "question": data.question,
+        "answer": answer,
+        "similarity_score": highest_score,
+        "created_at": datetime.now(timezone.utc)
     }
 
-    result = documents_collection.insert_one(document)
+    chat_history_collection.insert_one(chat_record)
 
+    # Step 8: Return response
     return {
-        "message": "Document saved successfully",
-        "document_id": str(result.inserted_id)
-    }    
-    
- 
+        "question": data.question,
+        "document_id": data.document_id,
+        "filename": document["filename"],
+        "chunk_index": best_match["chunk_index"],
+        "similarity_score": highest_score,
+        "answer": answer
+    }
+
+
+
+# Get all documents
+
 @router.get("/documents")
 def get_documents():
-    documents = list(documents_collection.find())
+
+    # Retrieve documents from MongoDB
+    documents = list(
+        documents_collection.find(
+            {},
+            {
+                "filename": 1,
+                "file_type": 1,
+                "file_path": 1,
+                "created_at": 1,
+                "chunks": 1
+            }
+        )
+    )
+
+    # Prepare response
+    result = []
 
     for document in documents:
-        document["_id"] = str(document["_id"])
 
-    return documents    
-    
-    
-@router.put("/documents")
-def update_document():
-    result = documents_collection.update_one(
-        {"filename": "python_notes.pdf"},
-        {"$set": {"filename": "django_notes.pdf"}}
-    )
+        result.append({
+            "document_id": str(document["_id"]),
+            "filename": document["filename"],
+            "file_type": document.get("file_type"),
+            "file_path": document.get("file_path"),
+            "total_chunks": len(document.get("chunks", [])),
+            "created_at": document.get("created_at")
+        })
 
     return {
-        "message": "Document updated successfully",
-        "modified_count": result.modified_count
+        "total_documents": len(result),
+        "documents": result
     }
-    
-@router.delete("/documents")
-def delete_document():
-    result = documents_collection.delete_one(
-        {"filename": "django_notes.pdf"}
-    )
+
+
+# Delete selected PDF
+@router.delete("/documents/{document_id}")
+def delete_document(document_id: str):
+
+    # 1. Validate document ID
+    if not ObjectId.is_valid(document_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid document ID"
+        )
+
+    # 2. Find document
+    document = documents_collection.find_one({
+        "_id": ObjectId(document_id)
+    })
+
+    if not document:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found"
+        )
+
+    # 3. Delete PDF file
+    file_path = document.get("file_path")
+
+    if file_path and os.path.exists(file_path):
+        os.remove(file_path)
+
+    # 4. Delete related chat history
+    chat_history_collection.delete_many({
+        "document_id": document_id
+    })
+
+    # 5. Delete MongoDB document
+    documents_collection.delete_one({
+        "_id": ObjectId(document_id)
+    })
 
     return {
-        "message": "Document deleted successfully",
-        "deleted_count": result.deleted_count
-    }        
-    
-    
+        "message": "Document deleted successfully"
+    }
+
+
+# Upload PDF
+
 @router.post("/upload")
 def upload_pdf(file: UploadFile = File(...)):
 
-    file_path = f"uploads/{file.filename}"
+    # Check PDF file extension
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only PDF files are allowed"
+        )
+        
+        
+    # Validate actual PDF file signature
+    file_signature = file.file.read(5)
 
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    if file_signature != b"%PDF-":
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid PDF file"
+        )
 
-    document = {
-        "filename": file.filename,
-        "file_path": file_path,
-        "file_type": file.content_type
-    }
+    # Reset file pointer
+    file.file.seek(0)    
 
-    result = documents_collection.insert_one(document)
+    # Check PDF file size (maximum 50 MB)
+    MAX_FILE_SIZE = 50 * 1024 * 1024
 
-    return {
-        "message": "PDF uploaded successfully",
-        "filename": file.filename,
-        "document_id": str(result.inserted_id)
-    }
-    
+    file.file.seek(0, os.SEEK_END)
+    file_size = file.file.tell()
+    file.file.seek(0)
+
+    if file_size > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail="PDF file size must not exceed 50 MB"
+        )
+
+    # Create uploads folder if it doesn't exist
+    os.makedirs("uploads", exist_ok=True)
+
+    # Generate a unique filename
+    unique_filename = f"{uuid.uuid4()}.pdf"
+
+    # Create file path using unique filename
+    file_path = os.path.join("uploads", unique_filename)
+
+    try:
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        document = {
+            "filename": file.filename,
+            "stored_filename": unique_filename,
+            "file_path": file_path,
+            "file_type": file.content_type,
+            "created_at": datetime.now(timezone.utc)
+        }
+
+        result = documents_collection.insert_one(document)
+
+        return {
+            "message": "PDF uploaded successfully",
+            "filename": file.filename,
+            "document_id": str(result.inserted_id)
+        }
+
+    except Exception as error:
+        # Remove partially saved file if upload fails
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"PDF upload failed: {str(error)}"
+        )
+
+    finally:
+        file.file.close()
 
 
 
-
+# Extract PDF text and generate embeddings
 @router.get("/extract-text/{document_id}")
 def extract_pdf_text(document_id: str):
 
-    # Validate MongoDB document ID
+    # Step 1: Validate document ID
     if not ObjectId.is_valid(document_id):
-        return {"error": "Invalid document ID"}
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid document ID"
+        )
 
-    # Find document in MongoDB
+    # Step 2: Find document
     document = documents_collection.find_one(
         {"_id": ObjectId(document_id)}
     )
 
     if not document:
-        return {"error": "Document not found"}
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found"
+        )
 
-    # Read PDF file
-    reader = PdfReader(document["file_path"])
+    # Step 3: Check PDF file
+    file_path = document.get("file_path")
 
-    extracted_text = ""
+    if not file_path or not os.path.isfile(file_path):
+        raise HTTPException(
+            status_code=404,
+            detail="PDF file not found on server"
+        )
 
-    # Extract text from all PDF pages
-    for page in reader.pages:
-        text = page.extract_text()
+    try:
+        # Step 4: Read PDF
+        reader = PdfReader(file_path)
 
-        if text:
-            extracted_text += text + "\n"
+        extracted_text = ""
 
-    # Split extracted text into chunks
-    chunks = split_text_into_chunks(extracted_text)
+        for page in reader.pages:
+            text = page.extract_text()
 
-    # Generate embeddings for each chunk
-    chunk_data = []
+            if text:
+                extracted_text += text + "\n"
 
-    for index, chunk in enumerate(chunks):
-        embedding = generate_embedding(chunk)
+        # Step 5: Check extracted text
+        if not extracted_text.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="No readable text found in this PDF"
+            )
 
-        chunk_data.append({
-            "chunk_index": index,
-            "text": chunk,
-            "embedding": embedding
-        })
+        # Step 6: Split text into chunks
+        chunks = split_text_into_chunks(extracted_text)
 
-    # Save extracted text, chunks, and embeddings in MongoDB
-    documents_collection.update_one(
-        {"_id": ObjectId(document_id)},
-        {
-            "$set": {
-                "extracted_text": extracted_text,
-                "chunks": chunk_data
+        # Step 7: Generate embeddings
+        chunk_data = []
+
+        for index, chunk in enumerate(chunks):
+
+            embedding = generate_embedding(chunk)
+
+            chunk_data.append({
+                "chunk_index": index,
+                "text": chunk,
+                "embedding": embedding
+            })
+
+        # Step 8: Save in MongoDB
+        documents_collection.update_one(
+            {"_id": ObjectId(document_id)},
+            {
+                "$set": {
+                    "extracted_text": extracted_text,
+                    "chunks": chunk_data
+                }
             }
+        )
+
+        return {
+            "message": "PDF text extracted and embeddings generated successfully",
+            "total_pages": len(reader.pages),
+            "total_chunks": len(chunk_data)
         }
+
+    except HTTPException:
+        raise
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"PDF processing failed: {str(error)}"
+        )
+
+
+
+
+@router.get("/chat-history/{document_id}")
+def get_chat_history(document_id: str):
+
+    # Validate document ID
+    if not ObjectId.is_valid(document_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid document ID"
+        )
+
+    # Retrieve chat history for the selected PDF
+    history = list(
+        chat_history_collection.find(
+            {"document_id": document_id}
+        ).sort("created_at", 1)
+    )
+
+    # Convert MongoDB ObjectId to string
+    for chat in history:
+        chat["_id"] = str(chat["_id"])
+
+    return {
+        "document_id": document_id,
+        "total_chats": len(history),
+        "chat_history": history
+    }
+
+
+
+@router.delete("/chat-history/{document_id}")
+def delete_chat_history(document_id: str):
+
+    # Validate document ID
+    if not ObjectId.is_valid(document_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid document ID"
+        )
+
+    # Delete all chat history for the selected PDF
+    result = chat_history_collection.delete_many(
+        {"document_id": document_id}
     )
 
     return {
-        "message": "PDF text extracted and embeddings generated successfully",
-        "total_pages": len(reader.pages),
-        "total_chunks": len(chunk_data),
-        "extracted_text": extracted_text
+        "message": "Chat history deleted successfully",
+        "deleted_count": result.deleted_count
     }
-
