@@ -11,3 +11,5 @@ client = MongoClient(MONGODB_URL)
 database = client["ai_pdf_chat"]
 
 documents_collection = database["documents"]
+
+chat_history_collection = database["chat_history"]
