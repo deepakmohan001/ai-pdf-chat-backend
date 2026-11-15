@@ -1,25 +1,34 @@
-text = """
-Python is a programming language.
-FastAPI is used to build APIs.
-MongoDB is a NoSQL database.
-React is a JavaScript library.
-Django is a Python framework.
-"""
+from pypdf import PdfReader
+from app.services.chunking import split_text_into_chunks
 
-words = text.split()
+pdf_path = r"uploads\3aa8005e-4d92-4e4a-94e2-9d45e1a94e62.pdf"
 
-chunk_size = 5
-overlap = 2
+reader = PdfReader(pdf_path)
 
-chunks = []
+text = ""
 
-start = 0
+for page in reader.pages:
+    page_text = page.extract_text()
 
-while start < len(words):
-    chunk = words[start:start + chunk_size]
-    chunks.append(" ".join(chunk))
+    if page_text:
+        text += page_text + "\n"
 
-    start += chunk_size - overlap
 
-for index, chunk in enumerate(chunks, start=1):
-    print(f"Chunk {index}: {chunk}")
+# NEW CODE: Inspect extracted PDF lines
+lines = text.splitlines()
+
+for index, line in enumerate(lines):
+    print(f"{index}: {line.strip()}")
+
+
+# Existing chunking code
+chunks = split_text_into_chunks(text)
+
+print("Total chunks:", len(chunks))
+
+for index, chunk in enumerate(chunks):
+    print(f"\n{'=' * 50}")
+    print(f"CHUNK {index + 1}")
+    print(f"Word count: {len(chunk.split())}")
+    print("=" * 50)
+    print(chunk)
