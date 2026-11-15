@@ -30,89 +30,122 @@ def home():
     }
 
 
+
 @router.post("/ask")
 def ask_question(data: QuestionRequest):
 
-    # Step 1: Generate embedding for the question
-    question_embedding = generate_embedding(data.question)
-
-    # Step 2: Validate document ID
+    # Step 1: Validate document ID
     if not ObjectId.is_valid(data.document_id):
         raise HTTPException(
             status_code=400,
             detail="Invalid document ID"
         )
 
-    # Step 3: Retrieve selected PDF
+    # Step 2: Retrieve selected PDF
     document = documents_collection.find_one({
         "_id": ObjectId(data.document_id),
         "chunks": {"$exists": True}
     })
 
-    # Step 4: Check whether document exists
     if not document:
         raise HTTPException(
             status_code=404,
             detail="Document not found or PDF has not been processed"
         )
 
-    best_match = None
-    highest_score = -1
-
-    # Step 5: Search through PDF chunks
     chunks = document.get("chunks", [])
+
+    if not chunks:
+        raise HTTPException(
+            status_code=400,
+            detail="No processed chunks found in this document"
+        )
+
+    # Step 3: Generate question embedding
+    question_embedding = generate_embedding(data.question)
+
+    # Step 4: Calculate similarity scores
+    scored_chunks = []
 
     for chunk in chunks:
 
-        chunk_embedding = chunk["embedding"]
-
         similarity = util.cos_sim(
             question_embedding,
-            chunk_embedding
+            chunk["embedding"]
         )
 
         score = similarity.item()
 
-        if score > highest_score:
-            highest_score = score
-            best_match = chunk
+        scored_chunks.append({
+            "chunk_index": chunk["chunk_index"],
+            "text": chunk["text"],
+            "score": score
+        })
 
-    # Step 6: Check similarity threshold
-    SIMILARITY_THRESHOLD = 0.40
+    # Step 5: Sort chunks by similarity
+    scored_chunks.sort(
+        key=lambda item: item["score"],
+        reverse=True
+    )
 
-    if best_match is None or highest_score < SIMILARITY_THRESHOLD:
+    # Step 6: Retrieve top 3 chunks
+    TOP_K = 3
+    top_chunks = scored_chunks[:TOP_K]
+
+    # Step 7: Check similarity threshold
+    SIMILARITY_THRESHOLD = 0.20
+
+    highest_score = top_chunks[0]["score"]
+
+    if highest_score < SIMILARITY_THRESHOLD:
         raise HTTPException(
             status_code=404,
             detail="No relevant information found in the selected document"
         )
 
-    # Step 7: Generate answer using Ollama
+    # Step 8: Combine retrieved chunks
+    context = "\n\n".join(
+        chunk["text"] for chunk in top_chunks
+    )
+
+    # Step 9: Generate AI answer
     answer = generate_answer(
         data.question,
-        best_match["text"]
+        context
     )
-    
-    # Save chat history in MongoDB
+
+    # Step 10: Save chat history
     chat_record = {
         "document_id": data.document_id,
         "filename": document["filename"],
         "question": data.question,
         "answer": answer,
         "similarity_score": highest_score,
+        "retrieved_chunks": [
+            {
+                "chunk_index": chunk["chunk_index"],
+                "similarity_score": chunk["score"]
+            }
+            for chunk in top_chunks
+        ],
         "created_at": datetime.now(timezone.utc)
     }
 
     chat_history_collection.insert_one(chat_record)
 
-    # Step 8: Return response
+    # Step 11: Return response
     return {
         "question": data.question,
         "document_id": data.document_id,
         "filename": document["filename"],
-        "chunk_index": best_match["chunk_index"],
+        "retrieved_chunks": [
+            chunk["chunk_index"] for chunk in top_chunks
+        ],
         "similarity_score": highest_score,
         "answer": answer
     }
+
+
 
 
 
