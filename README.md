@@ -6,6 +6,7 @@ The backend is built with FastAPI and integrates MongoDB, Sentence Transformers,
 
 ## Technologies Used
 
+
 ### Backend
 - Python
 - FastAPI
