@@ -20,3 +20,9 @@ htmlcov/
 # Operating system files
 .DS_Store
 Thumbs.db
+
+# Uploaded PDF files
+uploads/
+
+# Local model/cache files
+.cache/
