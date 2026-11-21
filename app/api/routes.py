@@ -15,8 +15,6 @@ import uuid
 
 router = APIRouter()
 
-
-# Request model
 class QuestionRequest(BaseModel):
     question: str
     document_id: str
@@ -29,8 +27,6 @@ def home():
     return {
         "message": "Welcome to AI PDF Chat Application"
     }
-
-
 
 @router.post("/ask")
 def ask_question(data: QuestionRequest):
@@ -145,9 +141,6 @@ def ask_question(data: QuestionRequest):
         "similarity_score": highest_score,
         "answer": answer
     }
-
-
-
 
 
 # Get all documents
