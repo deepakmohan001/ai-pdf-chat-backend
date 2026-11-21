@@ -22,6 +22,7 @@ class QuestionRequest(BaseModel):
     document_id: str
 
 
+
 # Home endpoint
 @router.get("/")
 def home():
